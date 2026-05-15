@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sqlite3
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -12,7 +13,7 @@ from database import (
     add_order, update_order_status, get_user_orders, get_all_users, get_all_orders
 )
 from twiboost_api import get_services, add_order as tw_add_order, get_order_status
-from keyboards import main_menu, back_button, confirm_keyboard, admin_menu
+from keyboards import main_menu, back_button, confirm_keyboard
 from states import OrderStates, DepositStates
 from utils import calculate_price_rub, calculate_total_rub, safe_decode_link
 
@@ -44,7 +45,8 @@ class Pagination:
 
 # ---------------------- Обычные пользователи ----------------------
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     user = get_user(message.from_user.id)
     if not user:
         create_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
@@ -58,7 +60,8 @@ async def cmd_start(message: Message):
     )
 
 @router.callback_query(F.data == "main_menu")
-async def back_to_main(callback: CallbackQuery):
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     user = get_user(callback.from_user.id)
     balance = user["rub_balance"] if user else 0.0
     await callback.message.edit_text(
@@ -68,7 +71,8 @@ async def back_to_main(callback: CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data == "profile")
-async def profile(callback: CallbackQuery):
+async def profile(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     user = get_user(callback.from_user.id)
     balance = user["rub_balance"] if user else 0.0
     text = (f"👤 *Ваш профиль*\n\n"
@@ -80,6 +84,7 @@ async def profile(callback: CallbackQuery):
 
 @router.callback_query(F.data == "deposit")
 async def deposit(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.message.edit_text(
         "💰 Введите сумму пополнения в **Stars** (целое число от 1 до 100 000):\n\n"
         "1 Star = 1.5 ₽ будет зачислено на баланс.\n"
@@ -92,6 +97,10 @@ async def deposit(callback: CallbackQuery, state: FSMContext):
 
 @router.message(DepositStates.waiting_for_stars_amount)
 async def process_deposit_amount(message: Message, state: FSMContext):
+    if message.text.startswith('/'):
+        await state.clear()
+        await message.answer("Операция отменена.", reply_markup=main_menu())
+        return
     if not message.text.isdigit():
         await message.answer("❌ Введите целое число.")
         return
@@ -117,7 +126,8 @@ async def pre_checkout(query: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(query.id, ok=True)
 
 @router.message(F.successful_payment)
-async def successful_payment(message: Message):
+async def successful_payment(message: Message, state: FSMContext):
+    await state.clear()
     payload = message.successful_payment.invoice_payload
     if payload.startswith("deposit_"):
         parts = payload.split("_")
@@ -171,7 +181,8 @@ async def process_order_payment(message: Message):
             )
 
 @router.callback_query(F.data == "history")
-async def show_history(callback: CallbackQuery):
+async def show_history(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     orders = get_user_orders(callback.from_user.id, limit=10)
     if not orders:
         text = "📜 У вас пока нет заказов."
@@ -185,6 +196,7 @@ async def show_history(callback: CallbackQuery):
 # ---------------------- Категории и выбор услуги ----------------------
 @router.callback_query(F.data.startswith("cat_"))
 async def show_category(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     cat = callback.data.split("_")[1]
     filtered = []
     for s in services_cache:
@@ -249,6 +261,7 @@ async def paginate_callback(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("service_"))
 async def service_selected(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     service_id = int(callback.data.split("_")[1])
     service = next((s for s in services_cache if s["service"] == service_id), None)
     if not service:
@@ -269,6 +282,11 @@ async def service_selected(callback: CallbackQuery, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_link)
 async def get_link(message: Message, state: FSMContext):
+    # Если ввели команду — отменяем состояние
+    if message.text.startswith('/'):
+        await state.clear()
+        await message.answer("Команда отменена. Возврат в главное меню.", reply_markup=main_menu())
+        return
     link = message.text.strip()
     if not link.startswith("https://t.me/") and not link.startswith("http://t.me/"):
         await message.answer("❌ Введите корректную ссылку Telegram (начинается с https://t.me/)")
@@ -279,6 +297,10 @@ async def get_link(message: Message, state: FSMContext):
 
 @router.message(OrderStates.waiting_for_quantity)
 async def get_quantity(message: Message, state: FSMContext):
+    if message.text.startswith('/'):
+        await state.clear()
+        await message.answer("Команда отменена. Возврат в главное меню.", reply_markup=main_menu())
+        return
     if not message.text.isdigit():
         await message.answer("❌ Введите целое число")
         return
@@ -376,7 +398,6 @@ async def status_checker():
             tw_status = status_data.get("status")
             if tw_status == "Completed":
                 update_order_status(order_id, "completed", str(status_data))
-                # Уведомить пользователя (нужно получить user_id)
                 conn2 = sqlite3.connect("blondeboost.db")
                 c2 = conn2.cursor()
                 c2.execute("SELECT user_id FROM orders WHERE order_id = ?", (order_id,))
@@ -389,67 +410,3 @@ async def status_checker():
                         pass
             elif tw_status in ("Canceled", "Fail"):
                 update_order_status(order_id, "failed", str(status_data))
-
-# ---------------------- Админ-панель ----------------------
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
-@router.message(Command("admin_panel"))
-async def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет доступа к админ-панели.")
-        return
-    await message.answer(
-        "🔧 *Админ-панель BlondeBoost*\n\nВыберите действие:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=admin_menu()
-    )
-
-@router.callback_query(F.data == "admin_users")
-async def admin_users(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа")
-        return
-    users = get_all_users(limit=50)
-    if not users:
-        text = "📋 Список пользователей пуст."
-    else:
-        text = "📋 *Список пользователей (топ 50 по балансу):*\n\n"
-        for u in users:
-            text += f"ID: `{u[0]}` | Баланс: {u[1]:.2f} ₽ | {u[2]} | @{u[3] or 'нет'}\n"
-    await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_button())
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_orders")
-async def admin_orders(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа")
-        return
-    orders = get_all_orders(limit=50)
-    if not orders:
-        text = "📋 Список заказов пуст."
-    else:
-        text = "📋 *Последние 50 заказов:*\n\n"
-        for o in orders:
-            text += f"#{o[0]} | Юзер: {o[1]} | {o[2]} | {o[3]} ед. | {o[4]:.2f} ₽ | {o[5]}\n{o[6]}\n\n"
-    await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_button())
-    await callback.answer()
-
-@router.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа")
-        return
-    # Простая статистика
-    conn = sqlite3.connect("blondeboost.db")
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    total_users = c.fetchone()[0]
-    c.execute("SELECT SUM(price_rub) FROM orders WHERE status = 'completed'")
-    total_income = c.fetchone()[0] or 0.0
-    conn.close()
-    text = (f"📊 *Статистика*\n\n"
-            f"👥 Всего пользователей: {total_users}\n"
-            f"💰 Общий доход (выполненные заказы): {total_income:.2f} ₽")
-    await callback.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_button())
-    await callback.answer()
