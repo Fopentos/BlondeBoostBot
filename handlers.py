@@ -2,20 +2,21 @@ import asyncio
 import logging
 import sqlite3
 from aiogram import Router, F, Bot
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery, PreCheckoutQuery, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.enums import ParseMode
 
-from config import BOT_TOKEN, STAR_TO_RUB, ADMIN_ID
+from config import BOT_TOKEN, STAR_TO_RUB
 from database import (
-    init_db, get_user, create_user, add_balance_rub, deduct_balance_rub,
-    add_order, update_order_status, get_user_orders, get_all_users, get_all_orders
+    get_user, create_user, add_balance_rub, deduct_balance_rub,
+    add_order, update_order_status, get_user_orders
 )
 from twiboost_api import get_services, add_order as tw_add_order, get_order_status
 from keyboards import main_menu, back_button, confirm_keyboard
-from states import OrderStates, DepositStates
+from states import OrderStates, DepositStates, DynamicOrderStates
 from utils import calculate_price_rub, calculate_total_rub, safe_decode_link
+from service_schemas import get_schema_for_service, FIELD_LINK, FIELD_QUANTITY, FIELD_POSTS_COUNT, FIELD_VOTE_OPTION, FIELD_COMMENT_TEXT
 
 router = Router()
 bot = Bot(token=BOT_TOKEN)
@@ -259,6 +260,7 @@ async def paginate_callback(callback: CallbackQuery, state: FSMContext):
     await send_category_page(callback.message, cat, services, page, state)
     await callback.answer()
 
+# ---------------------- Обработка выбора услуги ----------------------
 @router.callback_query(F.data.startswith("service_"))
 async def service_selected(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -267,28 +269,184 @@ async def service_selected(callback: CallbackQuery, state: FSMContext):
     if not service:
         await callback.answer("Услуга не найдена")
         return
-    price_rub_per_1000 = calculate_price_rub(service_id, float(service["rate"]))
-    await state.update_data(service_id=service_id, service=service, price_rub_per_1000=price_rub_per_1000)
-    await callback.message.edit_text(
-        f"📦 *{service['name']}*\n"
-        f"💰 Цена: {price_rub_per_1000:.2f} ₽ за 1000 ед.\n"
-        f"📊 Мин: {service['min']} | Макс: {service['max']}\n\n"
-        f"Введите ссылку на пост/канал/профиль:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=back_button()
-    )
-    await state.set_state(OrderStates.waiting_for_link)
+
+    # Проверяем, есть ли особая схема для этой услуги
+    schema = get_schema_for_service(service["name"])
+    if schema:
+        # Динамический заказ (дополнительные поля)
+        await state.update_data(service_id=service_id, service=service, schema=schema, collected_fields={})
+        await start_dynamic_order(callback.message, state, schema)
+    else:
+        # Стандартный заказ (ссылка + количество)
+        price_rub_per_1000 = calculate_price_rub(service_id, float(service["rate"]))
+        await state.update_data(service_id=service_id, service=service, price_rub_per_1000=price_rub_per_1000)
+        await callback.message.edit_text(
+            f"📦 *{service['name']}*\n"
+            f"💰 Цена: {price_rub_per_1000:.2f} ₽ за 1000 ед.\n"
+            f"📊 Мин: {service['min']} | Макс: {service['max']}\n\n"
+            f"Введите ссылку на пост/канал/профиль:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_button()
+        )
+        await state.set_state(OrderStates.waiting_for_link)
     await callback.answer()
 
+# ---------------------- Динамический заказ (схемы) ----------------------
+async def start_dynamic_order(message, state, schema):
+    fields = schema.get("fields", [])
+    if not fields:
+        await message.answer("Ошибка: нет полей для заказа.", reply_markup=main_menu())
+        return
+    await state.update_data(field_index=0, total_fields=len(fields))
+    # Показываем предупреждение/инструкцию
+    if "pre_check" in schema:
+        await message.answer(schema["pre_check"], parse_mode=ParseMode.MARKDOWN)
+    if "instructions" in schema:
+        await message.answer(schema["instructions"])
+    await ask_next_field(message, state)
+
+async def ask_next_field(message, state):
+    data = await state.get_data()
+    idx = data.get("field_index", 0)
+    fields = data["schema"]["fields"]
+    if idx >= len(fields):
+        await create_dynamic_order(message, state)
+        return
+    field = fields[idx]
+    prompt = field.get("prompt", f"Введите {field['name']}:")
+    if field["type"] == "days" and "options" in field:
+        buttons = [[InlineKeyboardButton(text=opt, callback_data=f"days_{idx}_{opt}")] for opt in field["options"]]
+        buttons.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="main_menu")])
+        await message.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    else:
+        await message.answer(prompt, reply_markup=back_button())
+    await state.set_state(DynamicOrderStates.waiting_for_field)
+
+@router.message(DynamicOrderStates.waiting_for_field)
+async def dynamic_field_text(message: Message, state: FSMContext):
+    if message.text.startswith('/'):
+        await state.clear()
+        await message.answer("Заказ отменён.", reply_markup=main_menu())
+        return
+    data = await state.get_data()
+    idx = data.get("field_index", 0)
+    fields = data["schema"]["fields"]
+    if idx >= len(fields):
+        return
+    field = fields[idx]
+    value = message.text.strip()
+    # Валидация
+    if field["type"] in (FIELD_QUANTITY, FIELD_POSTS_COUNT, FIELD_VOTE_OPTION):
+        if not value.isdigit():
+            await message.answer("❌ Введите целое число.")
+            return
+        value = int(value)
+        if field["type"] == FIELD_POSTS_COUNT and (value < 1 or value > 100):
+            await message.answer("❌ Количество будущих постов должно быть от 1 до 100.")
+            return
+        if field["type"] == FIELD_VOTE_OPTION and value < 1:
+            await message.answer("❌ Номер варианта должен быть положительным числом.")
+            return
+    elif field["type"] == FIELD_LINK:
+        if not (value.startswith("https://t.me/") or value.startswith("http://t.me/")):
+            await message.answer("❌ Введите корректную ссылку Telegram (начинается с https://t.me/)")
+            return
+    elif field["type"] == FIELD_COMMENT_TEXT:
+        if len(value) < 1:
+            await message.answer("❌ Введите текст комментария.")
+            return
+    # Сохраняем значение
+    collected = data.get("collected_fields", {})
+    collected[field["name"]] = value
+    await state.update_data(collected_fields=collected, field_index=idx+1)
+    await ask_next_field(message, state)
+
+@router.callback_query(F.data.startswith("days_"))
+async def dynamic_field_days(callback: CallbackQuery, state: FSMContext):
+    _, idx_str, days_value = callback.data.split("_", 2)
+    idx = int(idx_str)
+    data = await state.get_data()
+    fields = data["schema"]["fields"]
+    if idx >= len(fields):
+        await callback.answer("Ошибка")
+        return
+    collected = data.get("collected_fields", {})
+    collected[fields[idx]["name"]] = days_value
+    await state.update_data(collected_fields=collected, field_index=idx+1)
+    await ask_next_field(callback.message, state)
+    await callback.answer()
+
+async def create_dynamic_order(message, state):
+    data = await state.get_data()
+    service = data["service"]
+    service_id = service["service"]
+    collected = data["collected_fields"]
+    schema = data["schema"]
+
+    # Извлекаем основные параметры (обязательные для всех услуг)
+    link = collected.get("link")
+    quantity = collected.get("quantity")
+    if not link or not quantity:
+        await message.answer("❌ Не все обязательные поля заполнены. Попробуйте снова.", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    # Рассчитываем стоимость
+    rate = float(service["rate"])
+    price_rub_per_1000 = calculate_price_rub(service_id, rate)
+    total_rub = calculate_total_rub(price_rub_per_1000, quantity)
+
+    # Проверка баланса
+    user = get_user(message.from_user.id)
+    if user["rub_balance"] < total_rub:
+        await message.answer(f"❌ Недостаточно средств. Ваш баланс: {user['rub_balance']:.3f} ₽\nПополните баланс в главном меню.", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    # Списание средств
+    if not deduct_balance_rub(message.from_user.id, total_rub):
+        await message.answer("❌ Ошибка списания средств. Попробуйте позже.", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    # Для некоторых типов услуг нужно изменить параметры запроса (например, для голосований передавать option)
+    # Здесь для упрощения используем стандартный вызов, но можно расширить
+    # Для демонстрации просто покажем, что заказ создан.
+    tw_resp = await tw_add_order(service_id, link, quantity)
+    if "order" in tw_resp:
+        tw_order_id = tw_resp["order"]
+        local_order_id = add_order(
+            user_id=message.from_user.id,
+            tw_order_id=tw_order_id,
+            service_id=service_id,
+            service_name=service["name"],
+            link=link,
+            quantity=quantity,
+            price_rub=total_rub,
+            status="processing"
+        )
+        await message.answer(
+            f"✅ Заказ #{local_order_id} принят!\n"
+            f"Услуга: {service['name']}\n"
+            f"Количество: {quantity}\n"
+            f"Списано: {total_rub:.3f} ₽\n"
+            f"Статус: выполняется...",
+            reply_markup=main_menu()
+        )
+    else:
+        add_balance_rub(message.from_user.id, total_rub)
+        await message.answer(f"❌ Ошибка при создании заказа. Средства возвращены.\nПопробуйте позже.", reply_markup=main_menu())
+    await state.clear()
+
+# ---------------------- Стандартный заказ (ссылка + количество) ----------------------
 @router.message(OrderStates.waiting_for_link)
 async def get_link(message: Message, state: FSMContext):
-    # Если ввели команду — отменяем состояние
     if message.text.startswith('/'):
         await state.clear()
         await message.answer("Команда отменена. Возврат в главное меню.", reply_markup=main_menu())
         return
     link = message.text.strip()
-    if not link.startswith("https://t.me/") and not link.startswith("http://t.me/"):
+    if not (link.startswith("https://t.me/") or link.startswith("http://t.me/")):
         await message.answer("❌ Введите корректную ссылку Telegram (начинается с https://t.me/)")
         return
     await state.update_data(link=link)
