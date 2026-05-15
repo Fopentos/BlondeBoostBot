@@ -12,17 +12,14 @@ from keyboards import back_button
 
 router = Router()
 
-# Состояния для добавления баланса
 class AdminAddBalanceStates(StatesGroup):
     waiting_for_user_id = State()
     waiting_for_amount = State()
 
 def is_admin(user_id: int) -> bool:
-    """Проверка, является ли пользователь администратором"""
     return user_id == ADMIN_ID
 
 def admin_menu() -> InlineKeyboardMarkup:
-    """Клавиатура админ-панели"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin_users")],
         [InlineKeyboardButton(text="📦 Список заказов", callback_data="admin_orders")],
@@ -32,8 +29,8 @@ def admin_menu() -> InlineKeyboardMarkup:
     ])
 
 @router.message(Command("admin_panel"))
-async def admin_panel(message: Message):
-    """Вход в админ-панель"""
+async def admin_panel(message: Message, state: FSMContext):
+    await state.clear()
     if not is_admin(message.from_user.id):
         await message.answer("❌ У вас нет доступа к админ-панели.")
         return
@@ -43,9 +40,34 @@ async def admin_panel(message: Message):
         reply_markup=admin_menu()
     )
 
+@router.message(Command("addbalance"))
+async def cmd_add_balance(message: Message, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Нет доступа")
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("❌ Использование: `/addbalance <user_id> <сумма_в_рублях>`\nПример: `/addbalance 123456789 100`", parse_mode="Markdown")
+        return
+    try:
+        user_id = int(args[1])
+        amount = float(args[2].replace(',', '.'))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Неверный формат. ID должен быть целым числом, сумма – положительным числом (можно с точкой).")
+        return
+    user = get_user(user_id)
+    if not user:
+        await message.answer(f"❌ Пользователь с ID {user_id} не найден.")
+        return
+    add_balance_rub(user_id, amount)
+    user = get_user(user_id)
+    await message.answer(f"✅ Пользователю `{user['full_name']}` (ID: `{user_id}`) добавлено `{amount:.2f}` ₽.\nНовый баланс: `{user['rub_balance']:.3f}` ₽", parse_mode="Markdown")
+
 @router.callback_query(F.data == "admin_users")
 async def admin_users(callback: CallbackQuery):
-    """Показать список пользователей (топ 50 по балансу)"""
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа")
         return
@@ -61,7 +83,6 @@ async def admin_users(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_orders")
 async def admin_orders(callback: CallbackQuery):
-    """Показать список последних 50 заказов"""
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа")
         return
@@ -77,7 +98,6 @@ async def admin_orders(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
-    """Показать общую статистику"""
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа")
         return
@@ -97,7 +117,6 @@ async def admin_stats(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_add_balance")
 async def admin_add_balance_start(callback: CallbackQuery, state: FSMContext):
-    """Начать процесс добавления баланса пользователю"""
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа")
         return
@@ -111,7 +130,6 @@ async def admin_add_balance_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminAddBalanceStates.waiting_for_user_id)
 async def admin_add_balance_get_user_id(message: Message, state: FSMContext):
-    """Получить ID пользователя"""
     if not is_admin(message.from_user.id):
         await message.answer("❌ Нет доступа")
         await state.clear()
@@ -135,7 +153,6 @@ async def admin_add_balance_get_user_id(message: Message, state: FSMContext):
 
 @router.message(AdminAddBalanceStates.waiting_for_amount)
 async def admin_add_balance_get_amount(message: Message, state: FSMContext):
-    """Получить сумму и добавить баланс"""
     if not is_admin(message.from_user.id):
         await message.answer("❌ Нет доступа")
         await state.clear()
