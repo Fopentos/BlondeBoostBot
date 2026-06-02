@@ -270,7 +270,7 @@ async def profile(callback: CallbackQuery, state: FSMContext):
 async def deposit(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
-        "💰 Введите сумму пополнения в **Stars** (целое число от 1 до 100 000):\n\n1 Star = 1.5 ₽\nПример: `100`",
+        "💰 Введите сумму пополнения в **Stars** (целое число от 1 до 100 000):\n\n1 Star = 1.25 ₽\nПример: `100`",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=back_button()
     )
