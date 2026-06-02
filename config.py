@@ -12,7 +12,7 @@ TWIBOOST_API_URL = "https://twiboost.com/api/v2"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 # Курс: 1 Star = 1.5 рубля
-STAR_TO_RUB = 1.5
+STAR_TO_RUB = 1.25
 
 # Глобальная наценка (коэффициент) – 2.0 = 100%
 DEFAULT_MARKUP_FACTOR = 2.0
