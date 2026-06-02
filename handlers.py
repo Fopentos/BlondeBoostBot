@@ -242,7 +242,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         f"✨ Добро пожаловать в BlondeBoost!\n\n"
         f"💰 Ваш баланс: {user['rub_balance']:.3f} ₽\n\n"
-        "Пополните баланс через Telegram Stars (1 Star = 1.5 ₽) и заказывайте услуги.",
+        "Пополните баланс через Telegram Stars (1 Star = 1.25 ₽) и заказывайте услуги.",
         reply_markup=main_menu()
     )
 
